@@ -1,0 +1,6 @@
+SELECT
+  a.total_earned_fees + b.total_earned_fees AS total_earned_fees,
+  a.total_txs + b.total_txs AS total_txs,
+  a.avg_fee_per_tx + b.avg_fee_per_tx AS avg_fee_per_tx
+FROM $query('127ec440-62a6-4f46-97e5-1dffa3cce6b6') a
+JOIN $query('c05032aa-117a-4c42-b5be-676ca92a5d89') b
