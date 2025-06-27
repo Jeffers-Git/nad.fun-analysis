@@ -1,0 +1,14 @@
+SELECT *
+FROM (
+SELECT * FROM $query('5abd87b0-2867-4b9e-867b-ce185f75fc7e')
+
+  UNION ALL
+
+SELECT * FROM $query('f311411c-77b1-4ef7-b14d-1f0045cea206')
+
+  UNION ALL
+
+SELECT * FROM $query('a2a7fce8-fd8f-480c-a43d-47a01ee75bfb')
+) combined
+ORDER BY total_volume DESC
+LIMIT 10;
