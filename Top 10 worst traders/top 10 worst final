@@ -1,0 +1,27 @@
+WITH combined AS (
+  SELECT real_user, total_invested, total_made FROM $query('c9fbaccc-1d21-4842-b965-fb0df8430304')
+
+    UNION ALL
+
+  SELECT real_user, total_invested, total_made FROM $query('54e66aa6-6ff5-4354-b65a-c03c95e74da1')
+
+),
+
+grouped AS (
+  SELECT 
+    real_user,
+    SUM(total_invested) AS total_invested,
+    SUM(total_made) AS total_made
+  FROM combined
+  GROUP BY real_user
+)
+
+SELECT
+  *,
+  total_made - total_invested AS pnl
+FROM grouped
+ORDER BY pnl ASC
+LIMIT 20
+
+ 
+
