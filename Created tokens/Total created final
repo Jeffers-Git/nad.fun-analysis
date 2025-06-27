@@ -1,0 +1,15 @@
+WITH created AS ( -- final
+    SELECT
+        -- block_timestamp,
+        -- tx_hash,
+        -- topic_1,
+        '0x' || SUBSTR(topic_3, 27) AS token_address,
+        -- regexp_substr_all(SUBSTR(data, 3), '.{64}') AS segmented
+    FROM monad.testnet.fact_event_logs
+    WHERE contract_address = '0x60216fb3285595f4643f9f7cddab842e799bd642'
+      AND topic_0 = '0x962c5f466b5c14a23d5aa7d7f1cd96153b1fd74124062d77ef00352a9812daf5'
+      AND block_timestamp >= '2025-02-19'
+)
+
+SELECT COUNT(DISTINCT token_address)
+FROM created 
