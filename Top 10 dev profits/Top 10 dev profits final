@@ -1,0 +1,14 @@
+SELECT *
+FROM (
+SELECT * FROM $query('27d6df1f-d5af-4447-be9c-7eaf1b502532')
+
+  UNION ALL
+
+SELECT * FROM $query('e96a87ef-8dd2-495b-b182-b5e48ff948c7')
+
+  UNION ALL
+
+SELECT * FROM $query('eeee9cc1-beb9-4c18-81ed-bcde1874b8af')
+) combined
+ORDER BY profit DESC
+LIMIT 10;
