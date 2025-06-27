@@ -1,0 +1,5 @@
+SELECT * FROM $query('12ef3c4f-1514-46b2-a42d-a4aee71180f0')
+
+  UNION ALL
+
+SELECT * FROM $query('9b0f845f-c8f6-4984-8043-da2bc23b0d7a')
