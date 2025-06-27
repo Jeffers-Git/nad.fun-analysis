@@ -1,0 +1,98 @@
+WITH base_traces AS (
+  SELECT
+    tx_hash,
+    from_address AS real_user
+  FROM monad.testnet.fact_traces
+  WHERE block_timestamp >= '2025-02-19'
+    AND tx_succeeded = 'TRUE'
+    AND trace_address IN ('ORIGIN')
+    AND (
+      (to_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6'
+       AND LEFT(input, 10) IN ('0xf19d6546', '0x526cc7a7', '0x02a57915')) --, '0xf9565530'))
+      -- OR
+      -- (to_address = '0x3bb9afb94c82752e47706a10779ea525cf95dc27'
+      --  AND LEFT(input, 10) IN ('0xa9059cbb'))
+      OR
+      (from_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6'
+       AND LEFT(input, 10) IN ('0xa9059cbb'))
+      OR
+      (to_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6' AND LEFT(input, 10) IN ('0x34d8f707', '0xe548cedd', '0x8ffc3453'))  -- sell txs
+    )
+),
+
+token_logs AS (
+    SELECT
+        tx_hash,
+        contract_address,
+        origin_from_address,
+        data,
+        topic_0,
+        event_index
+    FROM monad.testnet.fact_event_logs
+    WHERE block_timestamp >= '2025-02-19'
+),
+
+non_bonded_buy_refund_raw AS (
+    SELECT
+        tx_hash,
+        -- input,
+        trace_address,
+        LEFT(input, 10) AS funct_signature,
+        NULL AS token_involved
+        -- regexp_substr_all(SUBSTR(input, 11), '.{64}') AS segmented,
+        -- '0x' || SUBSTR(segmented[2], 25) AS token_involved
+    FROM monad.testnet.fact_traces
+    WHERE ((to_address = '0x3bb9afb94c82752e47706a10779ea525cf95dc27' AND funct_signature = '0xa9059cbb')
+        OR (to_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6' AND funct_signature = '0xf9565530'))
+      AND type = 'CALL'
+      AND trace_address IN ('6', 'ORIGIN')
+),
+
+non_bonded_buy_refund_cleaned AS (
+    SELECT
+        t.tx_hash,
+        COALESCE(t.token_involved, o.token_involved) AS token
+    FROM non_bonded_buy_refund_raw t
+    LEFT JOIN non_bonded_buy_refund_raw o
+      ON t.tx_hash = o.tx_hash AND o.trace_address = 'ORIGIN'
+    WHERE t.trace_address != 'ORIGIN'
+),
+
+non_bonded_buy_refund AS (
+    SELECT
+        t.tx_hash,
+        m.origin_from_address AS real_user,
+        -- t.token
+    FROM token_logs m
+    JOIN non_bonded_buy_refund_cleaned t 
+      ON m.contract_address = t.token AND t.tx_hash = m.tx_hash
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY t.tx_hash ORDER BY event_index DESC) = 1
+),
+
+pool_created AS (
+  SELECT
+    tx_hash,
+    '0x' || SUBSTR(data, 27, 40)  AS pool
+  FROM token_logs
+  WHERE contract_address = '0x13ed0d5e1567684d964469ccba8a977cda580827'
+    AND topic_0 = '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9'
+),
+
+pool_txs AS (
+  SELECT
+    l.tx_hash,
+    origin_from_address AS real_user,
+  FROM token_logs l
+  JOIN pool_created f ON contract_address = f.pool 
+  WHERE topic_0 = '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822'
+)
+
+SELECT
+  COUNT(DISTINCT tx_hash) AS total_txs
+FROM (
+  SELECT tx_hash FROM base_traces
+  UNION ALL
+  SELECT tx_hash FROM non_bonded_buy_refund
+  UNION ALL
+  SELECT tx_hash FROM pool_txs
+) combined
