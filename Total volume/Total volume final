@@ -1,0 +1,8 @@
+SELECT
+  a.total_non_bonded + b.total_non_bonded + c.total_non_bonded + d.total_non_bonded AS total_non_bonded,
+  a.total_pool + b.total_pool + c.total_pool + d.total_pool AS total_pool,
+  a.total_volume + b.total_volume + c.total_volume + d.total_volume AS total_volume
+FROM $query('156206d3-bfae-434e-a762-61deae1ac41d') a
+JOIN $query('6c6e5453-0e27-4638-8d0c-e6998218ba52') b
+JOIN $query('611c4fb3-c462-4ed3-a9da-9f6cc403277d') c
+JOIN $query('15824720-2846-4463-be9d-0374d719a7ce') d
