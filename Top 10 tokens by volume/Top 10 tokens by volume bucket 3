@@ -1,0 +1,464 @@
+WITH raw_created AS ( -- final
+    SELECT
+        topic_3,
+        regexp_substr_all(SUBSTR(data, 3), '.{64}') AS segmented
+    FROM monad.testnet.fact_event_logs
+    WHERE contract_address = '0x60216fb3285595f4643f9f7cddab842e799bd642'
+      AND topic_0 = '0x962c5f466b5c14a23d5aa7d7f1cd96153b1fd74124062d77ef00352a9812daf5'
+      AND block_timestamp >= '2025-02-19'
+),
+
+cleaned_created AS (
+    SELECT
+        segmented,
+        '0x' || SUBSTR(topic_3, 27) AS token_address,
+        CASE
+            WHEN livequery.utils.udf_hex_to_int(segmented[9]) <= POWER(10, 38) THEN livequery.utils.udf_hex_to_int(segmented[9]) * 2
+            ELSE NULL
+        END AS array_two,
+        CASE
+            WHEN livequery.utils.udf_hex_to_int(segmented[11]) <= POWER(10, 38) THEN livequery.utils.udf_hex_to_int(segmented[11]) * 2
+            ELSE NULL
+        END AS array_three
+    FROM raw_created
+),
+
+names_created AS (
+    SELECT
+        token_address,
+        livequery.utils.udf_hex_to_string(LEFT(segmented[12], array_three)) AS symbol,
+        livequery.utils.udf_hex_to_string(LEFT(segmented[10], array_two)) AS token_name
+    FROM cleaned_created
+),
+
+names_buckets AS (
+    SELECT *,
+          NTILE(3) OVER (ORDER BY token_address) AS bucket
+    FROM names_created
+    QUALIFY bucket = 3
+),
+
+base_traces AS (
+  SELECT
+    block_timestamp,
+    tx_hash,
+    from_address,
+    to_address,
+    input,
+    value,
+    LEFT(input, 10) AS funct_signature,
+    regexp_substr_all(SUBSTR(input, 11), '.{64}') AS segmented,
+    trace_address,
+    type
+  FROM monad.testnet.fact_traces
+  WHERE block_timestamp >= '2025-02-19' -- AND block_timestamp < '2025-04-20'
+    AND tx_succeeded = 'TRUE'
+    AND (
+      (to_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6'
+       AND LEFT(input, 10) IN ('0xf19d6546', '0x526cc7a7', '0x02a57915', '0xf9565530'))
+      OR
+      (to_address = '0x3bb9afb94c82752e47706a10779ea525cf95dc27'
+       AND LEFT(input, 10) IN ('0xa9059cbb'))
+      OR
+      (from_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6'
+       AND LEFT(input, 10) IN ('0xa9059cbb'))
+      OR
+      (to_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6' AND LEFT(input, 10) IN ('0x34d8f707', '0xe548cedd', '0x8ffc3453'))  -- sell txs
+    )
+    AND trace_address IN ('ORIGIN', '6', '7')
+),
+
+token_logs AS (
+    SELECT
+        block_timestamp,
+        tx_hash,
+        contract_address,
+        origin_from_address,
+        data,
+        topic_0,
+        topic_1,
+        topic_2,
+        event_index
+    FROM monad.testnet.fact_event_logs
+    WHERE block_timestamp >= '2025-02-19' -- AND block_timestamp < '2025-04-20'
+      AND tx_succeeded = 'TRUE'
+      -- AND contract_address in ('0x9569ad4b353d4811064ad9970b198fcb914428d5', LOWER('0x3bb9AFB94c82752E47706A10779EA525Cf95dc27'))
+      AND contract_address IN ((SELECT token_address FROM names_buckets) UNION (SELECT LOWER('0x3bb9AFB94c82752E47706A10779EA525Cf95dc27')))
+),
+
+non_bonded_txs AS (
+    SELECT
+        tx_hash,
+        from_address AS user,
+        value,
+        segmented,
+        funct_signature
+    FROM base_traces
+    WHERE to_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6'
+      AND trace_address = 'ORIGIN'
+),
+
+non_bonded_buy_raw AS (
+    SELECT
+        tx_hash,
+        user AS real_user,
+        value,
+        CASE
+          WHEN funct_signature = '0xf19d6546' THEN '0x' || SUBSTR(segmented[3], 25)
+          WHEN funct_signature = '0x526cc7a7' THEN '0x' || SUBSTR(segmented[2], 25)
+          ELSE NULL
+        END AS token_involved,
+        funct_signature
+    FROM non_bonded_txs
+    WHERE funct_signature = '0xf19d6546' OR funct_signature = '0x526cc7a7'
+),
+
+non_bonded_buy_joined AS (
+    SELECT
+        t.tx_hash,
+        t.real_user,
+        'Buy' AS event,
+        value AS amount_in,
+        value/1.01 AS amount_invest,
+        -- value-(value/1.01) AS fee_earned,
+        t.token_involved AS token,
+        m.data
+    FROM token_logs m
+    JOIN non_bonded_buy_raw t 
+      ON m.contract_address = t.token_involved AND t.tx_hash = m.tx_hash
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY t.tx_hash ORDER BY event_index DESC) = 1
+),
+
+non_bonded_buy AS (
+    SELECT
+        tx_hash,
+        real_user,
+        event,
+        -- amount_in,
+        amount_invest,
+        -- value-(value/1.01) AS fee_earned,
+        token,
+        -- livequery.utils.udf_hex_to_int(data) / '1e18' AS amount_out
+    FROM non_bonded_buy_joined
+),
+
+non_bonded_buy_refund_raw AS (
+    SELECT
+        tx_hash,
+        segmented,
+        '0x' || SUBSTR(segmented[2], 25) AS token_involved,
+        funct_signature,
+        trace_address
+    FROM base_traces
+    WHERE ((to_address = '0x3bb9afb94c82752e47706a10779ea525cf95dc27' AND funct_signature = '0xa9059cbb') OR (to_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6' AND funct_signature = '0xf9565530'))
+      AND type = 'CALL' 
+      AND trace_address IN ('6', 'ORIGIN')
+),
+
+non_bonded_buy_refund_cleaned AS (
+    SELECT
+        t.tx_hash,
+        COALESCE(t.token_involved, o.token_involved) AS token,
+        t.segmented
+    FROM non_bonded_buy_refund_raw t
+    LEFT JOIN non_bonded_buy_refund_raw o
+      ON t.tx_hash = o.tx_hash AND o.trace_address = 'ORIGIN'
+    WHERE t.trace_address != 'ORIGIN'
+),
+
+non_bonded_buy_refund_joined AS (
+    SELECT
+        t.tx_hash,
+        origin_from_address AS real_user,
+        'Buy' AS event,
+        t.token,
+        t.segmented,
+        data
+    FROM token_logs m
+    JOIN non_bonded_buy_refund_cleaned t 
+      ON m.contract_address = t.token AND t.tx_hash = m.tx_hash
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY t.tx_hash ORDER BY event_index DESC) = 1
+),
+
+non_bonded_buy_refund AS (
+    SELECT
+        tx_hash,
+        real_user,
+        'Buy' AS event,
+        livequery.utils.udf_hex_to_int(segmented[1]) / '1e18' AS amount_invest,
+        token,
+        -- livequery.utils.udf_hex_to_int(data) / '1e18' AS amount_out
+    FROM non_bonded_buy_refund_joined
+),
+
+non_bonded_buy_create_raw AS (
+    SELECT
+        tx_hash,
+        to_address,
+        from_address AS user,
+        value - 0.02 AS value_adjusted,
+        segmented,
+        LEFT(input, 10) AS funct_signature,
+        type,
+        trace_address
+    FROM base_traces
+    WHERE ((to_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6' AND funct_signature = '0x02a57915') OR (from_address = '0x822eb1add41cf87c3f178100596cf24c9a6442f6' AND funct_signature = '0xa9059cbb'))
+      AND type = 'CALL' 
+      AND trace_address IN ('ORIGIN', '7')
+),
+
+non_bonded_buy_create_cleaned AS (
+    SELECT
+        t.tx_hash,
+        t.user AS real_user,
+        'Buy' AS event,
+        -- t.value_adjusted AS amount_in,
+        t.value_adjusted/1.01 AS amount_invest,
+        -- t.value_adjusted-(t.value_adjusted/1.01) AS fee_earned,
+        o.to_address AS token,
+        t.funct_signature,
+        t.type,
+        t.trace_address
+    FROM non_bonded_buy_create_raw t
+    LEFT JOIN non_bonded_buy_create_raw o
+      ON t.tx_hash = o.tx_hash AND o.trace_address = '7'
+    WHERE t.trace_address != '7'
+),
+
+non_bonded_buy_create_joined AS (
+    SELECT
+        t.tx_hash,
+        real_user,
+        event,
+        -- amount_in,
+        amount_invest,
+        -- fee_earned,
+        token,
+        data
+    FROM token_logs m
+    JOIN non_bonded_buy_create_cleaned t 
+      ON m.contract_address = t.token AND t.tx_hash = m.tx_hash
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY t.tx_hash ORDER BY event_index DESC) = 1
+),
+
+non_bonded_buy_create AS (
+    SELECT
+        tx_hash,
+        real_user,
+        event,
+        amount_invest,
+        token,
+        -- livequery.utils.udf_hex_to_int(data) / '1e18' AS amount_out
+    FROM non_bonded_buy_create_joined
+),
+
+non_bonded_buy_final AS (
+  SELECT * FROM non_bonded_buy
+
+    UNION ALL
+
+  SELECT * FROM non_bonded_buy_refund
+
+    UNION ALL
+
+  SELECT * FROM non_bonded_buy_create
+),
+
+non_bonded_sell_raw AS (
+    SELECT
+        tx_hash,
+        user AS real_user,
+        livequery.utils.udf_hex_to_int(segmented[0]) / '1e18' AS amount_in,
+        CASE
+          WHEN funct_signature = '0x34d8f707' OR funct_signature = '0xe548cedd' THEN '0x' || SUBSTR(segmented[1], 25)
+          WHEN funct_signature = '0x8ffc3453' THEN '0x' || SUBSTR(segmented[2], 25)
+          ELSE NULL
+        END AS token_sold,
+        LOWER('0x3bb9AFB94c82752E47706A10779EA525Cf95dc27') AS token_gotten,
+        funct_signature
+    FROM non_bonded_txs
+    WHERE funct_signature = '0x34d8f707' OR funct_signature = '0xe548cedd' OR funct_signature = '0x8ffc3453'
+),
+
+non_bonded_sell_joined AS (
+    SELECT
+        t.tx_hash,
+        t.real_user,
+        'Sell' AS event,
+        -- amount_in,
+        token_sold,
+        data
+    FROM non_bonded_sell_raw t
+    JOIN token_logs m
+      ON t.tx_hash = m.tx_hash AND t.token_gotten = m.contract_address
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY m.tx_hash ORDER BY event_index DESC) = 1
+),
+
+non_bonded_sell_final AS (
+    SELECT
+        tx_hash,
+        real_user,
+        'Sell' AS event,
+        -- amount_in,
+        token_sold AS token,
+        livequery.utils.udf_hex_to_int(data) / '1e18' AS amount_received
+    FROM non_bonded_sell_joined
+    WHERE token_sold IN (SELECT token_address FROM names_buckets) -----------------------------------
+),
+
+non_bonded AS (
+  SELECT
+    tx_hash,
+    real_user,
+    event,
+    amount_invest AS amount_in,
+    token,
+    -- amount_out,
+    NULL AS amount_out,
+    -- fee_earned,
+    'non-bonded' AS type
+  FROM non_bonded_buy_final
+
+  UNION ALL
+
+  SELECT
+    tx_hash,
+    real_user,
+    event,
+    -- amount_in,
+    NULL AS amount_in,
+    token,
+    -- amount_out,
+    amount_received AS amount_out,
+    -- fee_earned,
+    'non-bonded' AS type
+  FROM non_bonded_sell_final
+),
+
+non_bonded_final AS (
+  SELECT
+    c.tx_hash,
+    event,
+    amount_in,
+    token,
+    token_name,
+    symbol,
+    amount_out,
+    type
+  FROM non_bonded c LEFT JOIN names_created n ON c.token = n.token_address
+),
+
+pool_created AS (
+  SELECT
+    block_timestamp,
+    tx_hash,
+    '0x' || SUBSTR(topic_1, 27) AS token_in,
+    '0x' || SUBSTR(topic_2, 27) AS token_out,
+    '0x' || SUBSTR(data, 27, 40)  AS pool
+  FROM monad.testnet.fact_event_logs
+  WHERE contract_address = '0x13ed0d5e1567684d964469ccba8a977cda580827'
+    AND topic_0 = '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9'
+    AND block_timestamp >= '2025-02-19'
+    AND ((token_in IN (SELECT token_address FROM names_buckets)) OR (token_out IN (SELECT token_address FROM names_buckets)))
+),
+
+pool_txs_raw AS (
+  SELECT
+    l.block_timestamp,
+    l.tx_hash,
+    REGEXP_SUBSTR_ALL(SUBSTR(data, 3), '.{64}') AS segmented,
+    f.token_in,
+    f.token_out,
+    livequery.utils.udf_hex_to_int(segmented[0]) / '1e18' AS amount0_in,
+    livequery.utils.udf_hex_to_int(segmented[1]) / '1e18' AS amount1_in,
+    livequery.utils.udf_hex_to_int(segmented[2]) / '1e18' AS amount0_out,
+    livequery.utils.udf_hex_to_int(segmented[3]) / '1e18' AS amount1_out,
+    contract_address
+  FROM monad.testnet.fact_event_logs l
+  JOIN pool_created f ON contract_address = f.pool 
+  WHERE topic_0 = '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822'
+    AND l.block_timestamp >= '2025-02-19' -- AND block_timestamp < '2025-04-20'
+    AND tx_succeeded = 'TRUE'
+),
+
+pool_txs_cleaned AS (
+  SELECT
+    CAST(block_timestamp AS DATE) AS tx_date,
+    tx_hash,
+    CASE WHEN amount0_in > '0' THEN token_in ELSE token_out END AS token_in,
+    CASE WHEN amount0_in > '0' THEN amount0_in ELSE amount1_in END AS amount_in,
+    CASE WHEN amount0_out > '0' THEN token_in ELSE token_out END AS token_out,
+    CASE WHEN amount0_out > '0' THEN amount0_out ELSE amount1_out END AS amount_out
+  FROM pool_txs_raw
+),
+
+pool_txs AS (
+  SELECT *
+  FROM (
+    SELECT
+      s.tx_hash,
+      CASE 
+        WHEN s.token_in = '0x3bb9afb94c82752e47706a10779ea525cf95dc27' THEN 'Buy' 
+        ELSE 'Sell' 
+      END AS event,
+      COALESCE(s.amount_in, 0) AS amount_in,
+      CASE WHEN s.token_in = '0x3bb9afb94c82752e47706a10779ea525cf95dc27' THEN s.token_out ELSE s.token_in END AS token,
+      COALESCE(s.amount_out, 0) AS amount_out,
+      'bonded' AS type,
+      ROW_NUMBER() OVER (PARTITION BY s.tx_hash ORDER BY s.tx_date DESC) AS rn
+    FROM pool_txs_cleaned s
+  )
+  WHERE rn = 1
+),
+
+-- pool_tx_filter AS (
+--   SELECT
+--     s.tx_hash,
+--     event,
+--     amount_in,
+--     token,
+--     token_name,
+--     symbol,
+--     amount_out,
+--     type
+--   FROM pool_txs
+  
+
+-- ),
+
+pool_txs_final AS (
+  SELECT
+    s.tx_hash,
+    event,
+    amount_in,
+    token,
+    token_name,
+    symbol,
+    amount_out,
+    type
+  FROM pool_txs s LEFT JOIN names_created n ON s.token = n.token_address
+),
+
+all_txs AS (
+  SELECT * FROM non_bonded_final
+    UNION ALL
+  SELECT * FROM pool_txs_final
+),
+
+token_volumes AS (
+  SELECT
+    token,
+    MIN(token_name) AS token_name,
+    MIN(symbol) AS symbol,
+    COUNT(*) AS tx_count,
+     COALESCE(SUM(CASE WHEN event = 'Buy' THEN COALESCE(amount_in, 0) END), 0) AS total_buy,
+     COALESCE(SUM(CASE WHEN event = 'Sell' THEN COALESCE(amount_out, 0) END), 0) AS total_sell
+  FROM all_txs
+  GROUP BY token
+)
+
+SELECT *,
+  total_buy + total_sell AS total_volume
+FROM token_volumes
+ORDER BY total_volume DESC
+LIMIT 20
